@@ -18,6 +18,7 @@
   var e = Math.floor(parseFloat(q.get("end")) || 0);
   if (s > 0) p.set("start", s);
   if (e > 0) p.set("end", e);
+  if (q.get("mute") === "1") p.set("mute", "1"); // demarre muet : le JukeBox remet le son seulement sur la vraie musique
   location.replace("https://www.youtube-nocookie.com/embed/" + id + "?" + p.toString());
 })();
 </script>
