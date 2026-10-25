@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- YouTube exige un "Referer" pour les lecteurs intégrés (sinon erreur 152/153) -->
+<!-- YouTube exige un "Referer" pour les lecteurs integres (sinon erreur 152/153) -->
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <title>ANF JukeBox - Lecteur</title>
 <style>
@@ -15,147 +15,154 @@
 <div id="player"></div>
 <script>
 /* ==========================================================================
-   ANF JUKEBOX - LECTEUR WEB (remplace http://botdan.com/JukeBox/VideoPlayer/V4/)
-   A heberger sur un site HTTPS (GitHub Pages, ton hebergeur FastDL...).
-   API appelee par l'addon (client_player.lua + popups d'apercu) :
-     JukeBox.PlayVideo(id)                    JukeBox.StopVideo()
-     JukeBox.PlayVideoFrom(id, debut)         JukeBox.SetVolume(0-100)
-     JukeBox.PlayVideoUntil(id, fin)
-     JukeBox.PlayVideoFromUntil(id, debut, fin)
-     player.loadVideoById / player.setVolume / player.stopVideo   (apercus)
-   Messages renvoyes a GMod via console.log :
-     JBREADY            lecteur YouTube pret
-     JBERR:<code>:<id>  erreur YouTube (2, 5, 100, 101, 150, 152, 153...)
-     JBLOG:<texte>      debug (visible avec jukebox_debug 1)
+   ANF JUKEBOX - LECTEUR WEB v2 (meme fonctionnement que l'addon d'origine)
+   - Page chargee UNE fois ; chaque musique est lancee dans le lecteur YouTube
+     integre (cadre) par l'API -> YouTube n'y met quasiment jamais de pub.
+   - Securite : le lecteur reste MUET tant que la vraie musique n'a pas demarre
+     (si une pub passe quand meme, elle n'est pas entendue).
+   - Synchro : se cale sur le temps du serveur envoye par le JukeBox (ANF_POS).
+   Etat voulu envoye par GMod toutes les 0,3 s :
+     ANF_SEQ / ANF_ID (musique voulue, '' = stop), ANF_POS + ANF_POS_AT (position
+     attendue), ANF_END (fin), ANF_LEN (duree de la musique), ANF_VOL (0-100)
+   Retours vers GMod : anfjb.Seen / Playing / Ad / Err (+ console.log)
+   API classique gardee (apercus des menus) : JukeBox.PlayVideo... / player.*
    ========================================================================== */
 (function () {
   "use strict";
 
-  var yt = null;            // vrai YT.Player
-  var ready = false;
-  var pending = [];         // appels faits avant que YouTube soit pret
-  var volume = 25;
-  var currentId = null;
-  var wantPlaying = false;
-  var retryTimer = null;
+  var yt = null, ready = false, pendingOpts = null;
+  var wantPlaying = false, currentId = null, loadedSeq = null;
+  var confirmed = false, lastT = -1, stuckSince = 0, lastSeek = 0;
+  var playSent = false, adSent = false, retry = 0;
+  if (window.ANF_VOL === undefined) window.ANF_VOL = 25;
 
-  function send(msg) { try { console.log(msg); } catch (e) {} }
-  function log(msg) { send("JBLOG:" + msg); }
-
-  function call(name, args) {
-    if (!ready || !yt || typeof yt[name] !== "function") {
-      pending.push([name, args]);
-      return;
-    }
-    try { yt[name].apply(yt, args || []); }
-    catch (e) { log("erreur " + name + " : " + e); }
+  function send(m) { try { console.log(m); } catch (e) {} }
+  function cb(fn, a) {
+    try { if (window.anfjb && typeof window.anfjb[fn] === "function") window.anfjb[fn](a === undefined ? "" : String(a)); } catch (e) {}
   }
-
-  function applyVolume() {
-    if (!ready) return;
-    try {
-      yt.setVolume(volume);
-      if (volume > 0) yt.unMute(); else yt.mute();
-    } catch (e) {}
-  }
-
-  // Si l'autoplay est bloque, on relance quelques fois
-  function watchStart() {
-    clearTimeout(retryTimer);
-    var tries = 0;
-    function check() {
-      if (!wantPlaying || !ready) return;
-      var st = -1;
-      try { st = yt.getPlayerState(); } catch (e) {}
-      if (st === 1 || st === 0) return;        // en lecture ou termine
-      tries++;
-      if (tries > 6) { log("la lecture ne demarre pas (etat " + st + ")"); return; }
-      if (st !== 3) { try { yt.playVideo(); } catch (e) {} } // 3 = buffering
-      retryTimer = setTimeout(check, 1500);
-    }
-    retryTimer = setTimeout(check, 2000);
+  function vol() { return Math.max(0, Math.min(100, Number(window.ANF_VOL) || 0)); }
+  function expected() {
+    if (typeof window.ANF_POS !== "number" || typeof window.ANF_POS_AT !== "number") return null;
+    return window.ANF_POS + (performance.now() - window.ANF_POS_AT) / 1000;
   }
 
   function load(id, start, end) {
     if (!id) return;
-    currentId = String(id);
-    wantPlaying = true;
+    currentId = String(id).replace(/[^\w-]/g, "");
+    wantPlaying = true; confirmed = false; lastT = -1; stuckSince = 0;
+    playSent = false; adSent = false; retry = 0;
     var opts = { videoId: currentId };
-    if (start !== undefined && start !== null && !isNaN(Number(start))) opts.startSeconds = Math.max(0, Number(start));
-    if (end !== undefined && end !== null && !isNaN(Number(end)) && Number(end) > 0) opts.endSeconds = Number(end);
-    log("lecture " + currentId + " " + JSON.stringify(opts));
-    call("loadVideoById", [opts]);
-    if (ready) { applyVolume(); watchStart(); }
+    start = Number(start); end = Number(end);
+    if (start > 0) opts.startSeconds = start;
+    if (end > 0) opts.endSeconds = end;
+    cb("Seen", navigator.userAgent);
+    send("JBLOG:lecture " + JSON.stringify(opts));
+    if (ready) { try { yt.mute(); } catch (e) {} yt.loadVideoById(opts); }
+    else pendingOpts = opts;
   }
 
-  // ----- API utilisee par l'addon -----
+  function stop() {
+    wantPlaying = false; confirmed = false; pendingOpts = null;
+    if (ready) { try { yt.stopVideo(); } catch (e) {} }
+  }
+
+  function loop() {
+    // Etat voulu envoye par GMod
+    if (typeof window.ANF_SEQ === "number" && window.ANF_SEQ !== loadedSeq) {
+      loadedSeq = window.ANF_SEQ;
+      if (window.ANF_ID) { var ex = expected(); load(window.ANF_ID, ex === null ? 0 : Math.max(0, ex), window.ANF_END); }
+      else stop();
+    }
+    if (!ready || !wantPlaying) return;
+
+    var st, cur, dur;
+    try { st = yt.getPlayerState(); cur = yt.getCurrentTime(); dur = yt.getDuration(); } catch (e) { return; }
+    var now = performance.now();
+    var L = Number(window.ANF_LEN) || 0;
+    var durOk = !(L > 20 && dur > 0 && dur < L * 0.8 && (L - dur) > 5);
+
+    if (!confirmed) {
+      try { if (!yt.isMuted()) yt.mute(); } catch (e) {}
+      if (st === 1 && durOk && lastT >= 0 && cur > lastT + 0.05) {
+        confirmed = true;                        // la vraie musique avance -> on peut remettre le son
+      } else {
+        if (st === 1) {
+          if (lastT >= 0 && Math.abs(cur - lastT) < 0.01) { if (!stuckSince) stuckSince = now; } else stuckSince = 0;
+          if ((!durOk || (stuckSince && now - stuckSince > 2000)) && !adSent) { adSent = true; cb("Ad"); send("JBLOG:pub detectee (reste muette)"); }
+          lastT = cur;
+        } else if (st !== 3 && st !== 0) {
+          retry++;
+          if (retry % 8 === 0) { try { yt.playVideo(); } catch (e) {} }
+        }
+        return;
+      }
+    }
+
+    if (!durOk) { confirmed = false; lastT = -1; return; }  // pub en cours de musique : on recoupe
+
+    var e = Number(window.ANF_END) || 0;
+    if (e > 0 && cur >= e) { if (st === 1) { try { yt.pauseVideo(); } catch (er) {} } return; }
+
+    var exp = expected();
+    if (exp !== null && st === 1 && Math.abs(cur - exp) > 1.5 && now - lastSeek > 4000 && (!(dur > 0) || exp < dur - 1)) {
+      lastSeek = now;
+      try { yt.seekTo(exp, true); } catch (er) {}
+    }
+
+    var v = vol();
+    try {
+      if (yt.getVolume() !== v) yt.setVolume(v);
+      if (v > 0) { if (yt.isMuted()) yt.unMute(); } else if (!yt.isMuted()) yt.mute();
+    } catch (er) {}
+    if (!playSent && st === 1) { playSent = true; cb("Playing"); send("JBPLAYING"); }
+  }
+
+  // ----- API classique (utilisee par les apercus des menus) -----
   window.JukeBox = {
-    PlayVideo:          function (id)             { load(id); },
-    PlayVideoFrom:      function (id, start)      { load(id, start); },
+    __anf: 2,
+    PlayVideo:          function (id)             { load(id, 0, 0); },
+    PlayVideoFrom:      function (id, start)      { load(id, start, 0); },
     PlayVideoUntil:     function (id, end)        { load(id, 0, end); },
     PlayVideoFromUntil: function (id, start, end) { load(id, start, end); },
-    StopVideo: function () {
-      wantPlaying = false;
-      clearTimeout(retryTimer);
-      call("stopVideo", []);
-    },
-    SetVolume: function (v) {
-      v = Number(v);
-      if (isNaN(v)) return;
-      volume = Math.max(0, Math.min(100, v));
-      applyVolume();
-    }
+    StopVideo:          function ()               { stop(); },
+    SetVolume:          function (v)              { v = Number(v); if (!isNaN(v)) window.ANF_VOL = Math.max(0, Math.min(100, v)); }
   };
-
-  // ----- Objet "player" utilise par les popups d'apercu de l'addon -----
   window.player = {
     loadVideoById: function (a, b) {
-      if (typeof a === "object") { load(a.videoId, a.startSeconds, a.endSeconds); }
-      else { load(a, b); }
+      if (typeof a === "object") load(a.videoId, a.startSeconds, a.endSeconds); else load(a, b, 0);
     },
-    setVolume: function (v) { window.JukeBox.SetVolume(v); },
-    stopVideo: function () { window.JukeBox.StopVideo(); },
-    playVideo: function () { wantPlaying = true; call("playVideo", []); },
-    pauseVideo: function () { wantPlaying = false; call("pauseVideo", []); }
+    setVolume:  function (v) { window.JukeBox.SetVolume(v); },
+    stopVideo:  function ()  { stop(); },
+    playVideo:  function ()  { wantPlaying = true; if (ready) { try { yt.playVideo(); } catch (e) {} } },
+    pauseVideo: function ()  { wantPlaying = false; if (ready) { try { yt.pauseVideo(); } catch (e) {} } }
   };
 
-  // ----- Chargement de l'API YouTube -----
   window.onYouTubeIframeAPIReady = function () {
-    var vars = {
-      autoplay: 1, controls: 0, disablekb: 1, fs: 0, rel: 0,
-      iv_load_policy: 3, playsinline: 1, enablejsapi: 1
-    };
+    var vars = { autoplay: 1, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3, playsinline: 1, enablejsapi: 1, mute: 1 };
     if (/^https?:$/.test(location.protocol)) vars.origin = location.origin;
-
     yt = new YT.Player("player", {
       width: "100%", height: "100%",
-      host: "https://www.youtube-nocookie.com",   // mode confidentialite : pas de pubs ciblees
+      host: "https://www.youtube-nocookie.com",
       playerVars: vars,
       events: {
         onReady: function () {
           ready = true;
-          applyVolume();
-          var q = pending; pending = [];
-          for (var i = 0; i < q.length; i++) {
-            try { yt[q[i][0]].apply(yt, q[i][1] || []); } catch (e) {}
-          }
-          if (wantPlaying) { applyVolume(); watchStart(); }
+          try { yt.mute(); } catch (e) {}
+          if (pendingOpts) { var o = pendingOpts; pendingOpts = null; yt.loadVideoById(o); }
           send("JBREADY");
         },
-        onStateChange: function (e) {
-          if (e.data === 1) applyVolume();      // a chaque demarrage, on remet le volume
-        },
-        onError: function (e) {
-          wantPlaying = false;
-          send("JBERR:" + e.data + ":" + (currentId || "?"));
+        onError: function (ev) {
+          cb("Err", "erreur YouTube " + (ev && ev.data));
+          send("JBERR:" + (ev && ev.data) + ":" + (currentId || "?"));
         }
       }
     });
   };
 
+  setInterval(loop, 250);
   var tag = document.createElement("script");
   tag.src = "https://www.youtube.com/iframe_api";
-  tag.onerror = function () { send("JBERR:NOAPI:" + (currentId || "?")); };
+  tag.onerror = function () { cb("Err", "API YouTube injoignable"); send("JBERR:NOAPI:" + (currentId || "?")); };
   document.head.appendChild(tag);
 })();
 </script>
