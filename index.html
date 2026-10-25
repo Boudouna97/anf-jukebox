@@ -66,55 +66,56 @@
     if (ready) { try { yt.stopVideo(); } catch (e) {} }
   }
 
+  // NB : on ne se fie PAS a getPlayerState() (YouTube renvoie parfois -1 alors que la video joue) :
+  // on regarde si la position AVANCE vraiment.
+  var advCount = 0;
   function loop() {
     // Etat voulu envoye par GMod
     if (typeof window.ANF_SEQ === "number" && window.ANF_SEQ !== loadedSeq) {
       loadedSeq = window.ANF_SEQ;
-      if (window.ANF_ID) { var ex = expected(); load(window.ANF_ID, ex === null ? 0 : Math.max(0, ex), window.ANF_END); }
+      if (window.ANF_ID) { var ex = expected(); load(window.ANF_ID, ex === null ? 0 : Math.max(0, ex), window.ANF_END); advCount = 0; }
       else stop();
     }
     if (!ready || !wantPlaying) return;
 
-    var st, cur, dur;
-    try { st = yt.getPlayerState(); cur = yt.getCurrentTime(); dur = yt.getDuration(); } catch (e) { return; }
+    var cur, dur;
+    try { cur = yt.getCurrentTime(); dur = yt.getDuration(); } catch (e) { return; }
     var now = performance.now();
     var L = Number(window.ANF_LEN) || 0;
     var durOk = !(L > 20 && dur > 0 && dur < L * 0.8 && (L - dur) > 5);
+    var adv = lastT >= 0 && cur > lastT + 0.05 && cur - lastT < 2;   // la lecture avance
+    if (adv) { advCount++; stuckSince = 0; } else { advCount = 0; if (!stuckSince) stuckSince = now; }
+    lastT = cur;
 
     if (!confirmed) {
       try { if (!yt.isMuted()) yt.mute(); } catch (e) {}
-      if (st === 1 && durOk && lastT >= 0 && cur > lastT + 0.05) {
+      if (durOk && advCount >= 2) {
         confirmed = true;                        // la vraie musique avance -> on peut remettre le son
       } else {
-        if (st === 1) {
-          if (lastT >= 0 && Math.abs(cur - lastT) < 0.01) { if (!stuckSince) stuckSince = now; } else stuckSince = 0;
-          if ((!durOk || (stuckSince && now - stuckSince > 2000)) && !adSent) { adSent = true; cb("Ad"); send("JBLOG:pub detectee (reste muette)"); }
-          lastT = cur;
-        } else if (st !== 3 && st !== 0) {
-          retry++;
-          if (retry % 8 === 0) { try { yt.playVideo(); } catch (e) {} }
-        }
+        if (dur > 0 && (!durOk || now - stuckSince > 2500) && !adSent) { adSent = true; cb("Ad"); send("JBLOG:pub detectee (reste muette)"); }
+        if (stuckSince && now - stuckSince > 3000) { retry++; if (retry % 8 === 0) { try { yt.playVideo(); } catch (e) {} } }
         return;
       }
     }
 
-    if (!durOk) { confirmed = false; lastT = -1; return; }  // pub en cours de musique : on recoupe
+    if (!durOk) { confirmed = false; advCount = 0; return; }   // pub en cours de musique : on recoupe
 
     var e = Number(window.ANF_END) || 0;
-    if (e > 0 && cur >= e) { if (st === 1) { try { yt.pauseVideo(); } catch (er) {} } return; }
+    if (e > 0 && cur >= e) { try { yt.pauseVideo(); } catch (er) {} wantPlaying = false; return; }
 
     var exp = expected();
-    if (exp !== null && st === 1 && Math.abs(cur - exp) > 1.5 && now - lastSeek > 4000 && (!(dur > 0) || exp < dur - 1)) {
+    if (exp !== null && Math.abs(cur - exp) > 1.5 && now - lastSeek > 4000 && (!(dur > 0) || exp < dur - 1)) {
       lastSeek = now;
       try { yt.seekTo(exp, true); } catch (er) {}
     }
+    if (stuckSince && now - stuckSince > 3000) { try { yt.playVideo(); } catch (er) {} stuckSince = now; }
 
     var v = vol();
     try {
       if (yt.getVolume() !== v) yt.setVolume(v);
       if (v > 0) { if (yt.isMuted()) yt.unMute(); } else if (!yt.isMuted()) yt.mute();
     } catch (er) {}
-    if (!playSent && st === 1) { playSent = true; cb("Playing"); send("JBPLAYING"); }
+    if (!playSent) { playSent = true; cb("Playing"); send("JBPLAYING"); }
   }
 
   // ----- API classique (utilisee par les apercus des menus) -----
